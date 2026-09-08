@@ -1,0 +1,189 @@
+name: Build Stirling PDF Linux ARM64 Desktop
+
+on:
+  workflow_dispatch:
+  push:
+    tags:
+      - "arm64-desktop-*"
+
+permissions:
+  contents: read
+
+jobs:
+  build-linux-arm64:
+    name: Linux ARM64 desktop
+    runs-on: ubuntu-22.04-arm
+    timeout-minutes: 90
+
+    env:
+      CI: "true"
+      DISABLE_ADDITIONAL_FEATURES: "true"
+      JPDFIUM_PLATFORMS: "linux-arm64"
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v6
+
+      - name: Verify native ARM64 runner
+        shell: bash
+        run: |
+          set -euo pipefail
+          echo "uname -m: $(uname -m)"
+          echo "runner arch: $RUNNER_ARCH"
+          test "$(uname -m)" = "aarch64"
+
+      - name: Install Linux/Tauri build dependencies
+        shell: bash
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install -y \
+            libgtk-3-dev \
+            libwebkit2gtk-4.0-dev \
+            libwebkit2gtk-4.1-dev \
+            libappindicator3-dev \
+            librsvg2-dev \
+            patchelf \
+            libjavascriptcoregtk-4.0-dev \
+            libsoup2.4-dev \
+            libjavascriptcoregtk-4.1-dev \
+            libsoup-3.0-dev \
+            libssl-dev \
+            libfuse2 \
+            file
+
+      - name: Setup Node.js 22
+        uses: actions/setup-node@v7
+        with:
+          node-version: "22"
+          cache: npm
+          cache-dependency-path: frontend/package-lock.json
+
+      - name: Setup Rust stable
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Setup Java 25
+        uses: actions/setup-java@v5
+        with:
+          distribution: temurin
+          java-version: "25"
+          cache: gradle
+
+      - name: Setup Task
+        uses: go-task/setup-task@v2
+
+      - name: Show toolchain versions
+        shell: bash
+        run: |
+          set -euo pipefail
+          node --version
+          npm --version
+          rustc --version
+          cargo --version
+          java -version
+          task --version
+
+      - name: Prepare bundled backend and ARM64 JRE
+        shell: bash
+        run: |
+          set -euo pipefail
+          task desktop:prepare
+          echo "Bundled JRE:"
+          frontend/editor/src-tauri/runtime/jre/bin/java -version
+          echo "Bundled backend:"
+          ls -lh frontend/editor/src-tauri/libs/
+
+      - name: Run Tauri/Cargo tests
+        shell: bash
+        run: |
+          set -euo pipefail
+          task desktop:test
+
+      - name: Make libjvm discoverable for AppImage tooling
+        shell: bash
+        run: |
+          set -euo pipefail
+          JAVA_LIBJVM="$JAVA_HOME/lib/server/libjvm.so"
+          test -f "$JAVA_LIBJVM"
+          sudo ln -sf "$JAVA_LIBJVM" /usr/lib/libjvm.so
+          file "$JAVA_LIBJVM"
+
+      - name: Build ARM64 DEB
+        working-directory: frontend/editor
+        shell: bash
+        run: |
+          set -euo pipefail
+          npx tauri build \
+            --bundles deb \
+            --config '{"bundle":{"createUpdaterArtifacts":false}}'
+
+      - name: Build ARM64 AppImage
+        id: appimage
+        continue-on-error: true
+        working-directory: frontend/editor
+        shell: bash
+        run: |
+          set -euo pipefail
+          npx tauri build \
+            --bundles appimage \
+            --config '{"bundle":{"createUpdaterArtifacts":false}}'
+
+      # Keep the .deb downloadable even when the upstream AppImage toolchain is flaky.
+      - name: Collect and verify artifacts
+        id: collect
+        if: ${{ always() && !cancelled() }}
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          TARGET="$GITHUB_WORKSPACE/frontend/editor/src-tauri/target"
+          DIST="$GITHUB_WORKSPACE/dist"
+          mkdir -p "$DIST"
+
+          DEB="$(find "$TARGET" -type f -name '*.deb' | head -n 1)"
+          APPIMAGE="$(find "$TARGET" -type f -name '*.AppImage' | head -n 1 || true)"
+
+          test -n "$DEB"
+          echo "DEB: $DEB"
+
+          DEB_ARCH="$(dpkg-deb -f "$DEB" Architecture)"
+          echo "DEB architecture: $DEB_ARCH"
+          test "$DEB_ARCH" = "arm64"
+          cp "$DEB" "$DIST/Stirling-PDF-linux-arm64.deb"
+
+          if [ -n "$APPIMAGE" ]; then
+            echo "AppImage: $APPIMAGE"
+            file "$APPIMAGE"
+            file "$APPIMAGE" | grep -Eqi 'aarch64|ARM'
+            cp "$APPIMAGE" "$DIST/Stirling-PDF-linux-arm64.AppImage"
+            chmod +x "$DIST/Stirling-PDF-linux-arm64.AppImage"
+            echo "appimage_present=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "WARNING: ARM64 AppImage was not produced."
+            echo "appimage_present=false" >> "$GITHUB_OUTPUT"
+          fi
+
+          (
+            cd "$DIST"
+            sha256sum Stirling-PDF-linux-arm64.* > SHA256SUMS.txt
+          )
+
+          ls -lh "$DIST"
+          cat "$DIST/SHA256SUMS.txt"
+
+      - name: Upload Linux ARM64 desktop artifacts
+        if: ${{ always() && !cancelled() }}
+        uses: actions/upload-artifact@v7
+        with:
+          name: Stirling-PDF-linux-arm64
+          path: dist/*
+          if-no-files-found: error
+          retention-days: 14
+
+      - name: Require ARM64 AppImage
+        if: ${{ always() && !cancelled() && steps.collect.outputs.appimage_present != 'true' }}
+        shell: bash
+        run: |
+          echo "ERROR: .deb was built/uploaded, but AppImage generation failed." >&2
+          echo "Check the 'Build ARM64 AppImage' step for linuxdeploy/AppImage errors." >&2
+          exit 1
