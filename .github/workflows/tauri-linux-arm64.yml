@@ -50,6 +50,7 @@ jobs:
             libsoup-3.0-dev \
             libssl-dev \
             libfuse2 \
+            xdg-utils \
             file
 
       - name: Setup Node.js 22
@@ -119,7 +120,6 @@ jobs:
 
       - name: Build ARM64 AppImage
         id: appimage
-        continue-on-error: true
         working-directory: frontend/editor
         shell: bash
         run: |
